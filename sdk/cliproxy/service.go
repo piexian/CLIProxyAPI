@@ -421,7 +421,7 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 
 	// Initialize and load persisted usage statistics before usage tracking starts,
-	// ensuring we begin recording from a clean baseline.
+	// restoring previously accumulated metrics so they continue across restarts.
 	internalusage.SetPersistPath(s.configPath)
 	internalusage.LoadStatistics()
 
