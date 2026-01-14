@@ -74,6 +74,7 @@ func main() {
 	var iflowLogin bool
 	var iflowCookie bool
 	var noBrowser bool
+	var oauthCallbackPort int
 	var antigravityLogin bool
 	var kiroLogin bool
 	var kiroGoogleLogin bool
@@ -454,7 +455,8 @@ func main() {
 
 	// Create login options to be used in authentication flows.
 	options := &cmd.LoginOptions{
-		NoBrowser: noBrowser,
+		NoBrowser:    noBrowser,
+		CallbackPort: oauthCallbackPort,
 	}
 
 	// Register the shared token store once so all components use the same persistence backend.
