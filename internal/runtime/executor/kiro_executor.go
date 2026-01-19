@@ -217,6 +217,21 @@ func NewKiroExecutor(cfg *config.Config) *KiroExecutor {
 // Identifier returns the unique identifier for this executor.
 func (e *KiroExecutor) Identifier() string { return "kiro" }
 
+func (e *KiroExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth, req *http.Request) (*http.Response, error) {
+	if req == nil {
+		return nil, fmt.Errorf("kiro executor: request is nil")
+	}
+	if ctx == nil {
+		ctx = req.Context()
+	}
+	httpReq := req.WithContext(ctx)
+	if err := e.PrepareRequest(httpReq, auth); err != nil {
+		return nil, err
+	}
+	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	return httpClient.Do(httpReq)
+}
+
 // PrepareRequest prepares the HTTP request before execution.
 func (e *KiroExecutor) PrepareRequest(_ *http.Request, _ *cliproxyauth.Auth) error { return nil }
 
@@ -1487,87 +1502,16 @@ func (e *KiroExecutor) parseEventStream(body io.Reader) (string, []kiroclaude.Ki
 				log.Debugf("kiro: parseEventStream found metricsEvent: input=%d, output=%d",
 					usageInfo.InputTokens, usageInfo.OutputTokens)
 			}
+		}
 
-		case "meteringEvent":
-			// Handle metering events from Kiro API (usage billing information)
-			// Official format: { unit: string, unitPlural: string, usage: number }
-			if metering, ok := event["meteringEvent"].(map[string]interface{}); ok {
-				unit := ""
-				if u, ok := metering["unit"].(string); ok {
-					unit = u
-				}
-				usageVal := 0.0
-				if u, ok := metering["usage"].(float64); ok {
-					usageVal = u
-				}
-				log.Infof("kiro: parseEventStream received meteringEvent: usage=%.2f %s", usageVal, unit)
-				// Store metering info for potential billing/statistics purposes
-				// Note: This is separate from token counts - it's AWS billing units
-			} else {
-				// Try direct fields
-				unit := ""
-				if u, ok := event["unit"].(string); ok {
-					unit = u
-				}
-				usageVal := 0.0
-				if u, ok := event["usage"].(float64); ok {
-					usageVal = u
-				}
-				if unit != "" || usageVal > 0 {
-					log.Infof("kiro: parseEventStream received meteringEvent (direct): usage=%.2f %s", usageVal, unit)
-				}
+		// Check nested usage event
+		if usageEvent, ok := event["supplementaryWebLinksEvent"].(map[string]interface{}); ok {
+			if inputTokens, ok := usageEvent["inputTokens"].(float64); ok {
+				usageInfo.InputTokens = int64(inputTokens)
 			}
-
-		case "error", "exception", "internalServerException", "invalidStateEvent":
-			// Handle error events from Kiro API stream
-			errMsg := ""
-			errType := eventType
-
-			// Try to extract error message from various formats
-			if msg, ok := event["message"].(string); ok {
-				errMsg = msg
-			} else if errObj, ok := event[eventType].(map[string]interface{}); ok {
-				if msg, ok := errObj["message"].(string); ok {
-					errMsg = msg
-				}
-				if t, ok := errObj["type"].(string); ok {
-					errType = t
-				}
-			} else if errObj, ok := event["error"].(map[string]interface{}); ok {
-				if msg, ok := errObj["message"].(string); ok {
-					errMsg = msg
-				}
-				if t, ok := errObj["type"].(string); ok {
-					errType = t
-				}
+			if outputTokens, ok := usageEvent["outputTokens"].(float64); ok {
+				usageInfo.OutputTokens = int64(outputTokens)
 			}
-
-			// Check for specific error reasons
-			if reason, ok := event["reason"].(string); ok {
-				errMsg = fmt.Sprintf("%s (reason: %s)", errMsg, reason)
-			}
-
-			log.Errorf("kiro: parseEventStream received error event: type=%s, message=%s", errType, errMsg)
-
-			// For invalidStateEvent, we may want to continue processing other events
-			if eventType == "invalidStateEvent" {
-				log.Warnf("kiro: invalidStateEvent received, continuing stream processing")
-				continue
-			}
-
-			// For other errors, return the error
-			if errMsg != "" {
-				return "", nil, usageInfo, stopReason, fmt.Errorf("kiro API error (%s): %s", errType, errMsg)
-			}
-
-		default:
-			// Check for contextUsagePercentage in any event
-			if ctxPct, ok := event["contextUsagePercentage"].(float64); ok {
-				upstreamContextPercentage = ctxPct
-				log.Debugf("kiro: parseEventStream received context usage: %.2f%%", upstreamContextPercentage)
-			}
-			// Log unknown event types for debugging (to discover new event formats)
-			log.Debugf("kiro: parseEventStream unknown event type: %s, payload: %s", eventType, string(payload))
 		}
 
 		// Check for direct token fields in any event (fallback)
@@ -1608,16 +1552,6 @@ func (e *KiroExecutor) parseEventStream(body io.Reader) (string, []kiroclaude.Ki
 				}
 				log.Debugf("kiro: parseEventStream found usage object (fallback): input=%d, output=%d, total=%d",
 					usageInfo.InputTokens, usageInfo.OutputTokens, usageInfo.TotalTokens)
-			}
-		}
-
-		// Also check nested supplementaryWebLinksEvent
-		if usageEvent, ok := event["supplementaryWebLinksEvent"].(map[string]interface{}); ok {
-			if inputTokens, ok := usageEvent["inputTokens"].(float64); ok {
-				usageInfo.InputTokens = int64(inputTokens)
-			}
-			if outputTokens, ok := usageEvent["outputTokens"].(float64); ok {
-				usageInfo.OutputTokens = int64(outputTokens)
 			}
 		}
 	}
@@ -2319,16 +2253,16 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 
 					lastUsageUpdateLen = accumulatedContent.Len()
 					lastUsageUpdateTime = time.Now()
-					}
+				}
 
-					// TAG-BASED THINKING PARSING: Parse <thinking> tags from content
-					// Combine pending content with new content for processing
-					pendingContent.WriteString(contentDelta)
-					processContent := pendingContent.String()
-					pendingContent.Reset()
+				// TAG-BASED THINKING PARSING: Parse <thinking> tags from content
+				// Combine pending content with new content for processing
+				pendingContent.WriteString(contentDelta)
+				processContent := pendingContent.String()
+				pendingContent.Reset()
 
-					// Process content looking for thinking tags
-					for len(processContent) > 0 {
+				// Process content looking for thinking tags
+				for len(processContent) > 0 {
 					if inThinkBlock {
 						// We're inside a thinking block, look for </thinking>
 						endIdx := strings.Index(processContent, kirocommon.ThinkingEndTag)
@@ -2821,57 +2755,6 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 				}
 				log.Debugf("kiro: streamToChannel found metricsEvent: input=%d, output=%d",
 					totalUsage.InputTokens, totalUsage.OutputTokens)
-			}
-		}
-
-		// Check nested usage event
-		if usageEvent, ok := event["supplementaryWebLinksEvent"].(map[string]interface{}); ok {
-			if inputTokens, ok := usageEvent["inputTokens"].(float64); ok {
-				totalUsage.InputTokens = int64(inputTokens)
-			}
-			if outputTokens, ok := usageEvent["outputTokens"].(float64); ok {
-				totalUsage.OutputTokens = int64(outputTokens)
-			}
-		}
-
-		// Check for direct token fields in any event (fallback)
-		if totalUsage.InputTokens == 0 {
-			if inputTokens, ok := event["inputTokens"].(float64); ok {
-				totalUsage.InputTokens = int64(inputTokens)
-				log.Debugf("kiro: streamToChannel found direct inputTokens: %d", totalUsage.InputTokens)
-			}
-		}
-		if totalUsage.OutputTokens == 0 {
-			if outputTokens, ok := event["outputTokens"].(float64); ok {
-				totalUsage.OutputTokens = int64(outputTokens)
-				log.Debugf("kiro: streamToChannel found direct outputTokens: %d", totalUsage.OutputTokens)
-			}
-		}
-
-		// Check for usage object in any event (OpenAI format)
-		if totalUsage.InputTokens == 0 || totalUsage.OutputTokens == 0 {
-			if usageObj, ok := event["usage"].(map[string]interface{}); ok {
-				if totalUsage.InputTokens == 0 {
-					if inputTokens, ok := usageObj["input_tokens"].(float64); ok {
-						totalUsage.InputTokens = int64(inputTokens)
-					} else if inputTokens, ok := usageObj["prompt_tokens"].(float64); ok {
-						totalUsage.InputTokens = int64(inputTokens)
-					}
-				}
-				if totalUsage.OutputTokens == 0 {
-					if outputTokens, ok := usageObj["output_tokens"].(float64); ok {
-						totalUsage.OutputTokens = int64(outputTokens)
-					} else if outputTokens, ok := usageObj["completion_tokens"].(float64); ok {
-						totalUsage.OutputTokens = int64(outputTokens)
-					}
-				}
-				if totalUsage.TotalTokens == 0 {
-					if totalTokens, ok := usageObj["total_tokens"].(float64); ok {
-						totalUsage.TotalTokens = int64(totalTokens)
-					}
-				}
-				log.Debugf("kiro: streamToChannel found usage object (fallback): input=%d, output=%d, total=%d",
-					totalUsage.InputTokens, totalUsage.OutputTokens, totalUsage.TotalTokens)
 			}
 		}
 	}
