@@ -18,11 +18,14 @@ FROM alpine:3.22.0
 
 RUN apk add --no-cache tzdata
 
-RUN mkdir /CLIProxyAPI
+RUN mkdir -p /CLIProxyAPI && chmod 755 /CLIProxyAPI
 
 COPY --from=builder ./app/CLIProxyAPIPlus /CLIProxyAPI/CLIProxyAPIPlus
 
 COPY config.example.yaml /CLIProxyAPI/config.example.yaml
+
+# Pre-create usage_stats.json with write permissions for persistence
+RUN touch /CLIProxyAPI/usage_stats.json && chmod 666 /CLIProxyAPI/usage_stats.json
 
 WORKDIR /CLIProxyAPI
 

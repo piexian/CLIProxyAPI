@@ -1,7 +1,7 @@
 services:
   cli-proxy-api:
-    image: ${CLI_PROXY_IMAGE:-eceasy/cli-proxy-api-plus:latest}
-    pull_policy: always
+    image: cli-proxy-api:merged
+    pull_policy: never
     build:
       context: .
       dockerfile: Dockerfile
@@ -25,4 +25,5 @@ services:
       - ${CLI_PROXY_CONFIG_PATH:-./config.yaml}:/CLIProxyAPI/config.yaml
       - ${CLI_PROXY_AUTH_PATH:-./auths}:/root/.cli-proxy-api
       - ${CLI_PROXY_LOG_PATH:-./logs}:/CLIProxyAPI/logs
+      - ${CLI_PROXY_USAGE_STATS_PATH:-./usage_stats.json}:/CLIProxyAPI/usage_stats.json
     restart: unless-stopped
