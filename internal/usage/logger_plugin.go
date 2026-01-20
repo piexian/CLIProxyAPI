@@ -5,7 +5,10 @@ package usage
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -13,6 +16,12 @@ import (
 
 	"github.com/gin-gonic/gin"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
+	log "github.com/sirupsen/logrus"
+)
+
+const (
+	usageStatsFilename = "usage_stats.json"
+	usageStatsFileMode = 0o600
 )
 
 var statisticsEnabled atomic.Bool
@@ -341,7 +350,7 @@ func (s *RequestStatistics) MergeSnapshot(snapshot StatisticsSnapshot) MergeResu
 					continue
 				}
 				seen[key] = struct{}{}
-				s.recordImported(apiName, modelName, stats, detail)
+				s.recordImported(modelName, stats, detail)
 				result.Added++
 			}
 		}
@@ -350,7 +359,7 @@ func (s *RequestStatistics) MergeSnapshot(snapshot StatisticsSnapshot) MergeResu
 	return result
 }
 
-func (s *RequestStatistics) recordImported(apiName, modelName string, stats *apiStats, detail RequestDetail) {
+func (s *RequestStatistics) recordImported(modelName string, stats *apiStats, detail RequestDetail) {
 	totalTokens := detail.Tokens.TotalTokens
 	if totalTokens < 0 {
 		totalTokens = 0
@@ -469,4 +478,109 @@ func formatHour(hour int) string {
 	}
 	hour = hour % 24
 	return fmt.Sprintf("%02d", hour)
+}
+
+// Persistence related variables and functions.
+var persistPath string
+var persistPathMu sync.RWMutex
+
+// SetPersistPath sets the file path for persisting usage statistics.
+func SetPersistPath(configPath string) {
+	if configPath == "" {
+		return
+	}
+	path := filepath.Join(filepath.Dir(configPath), usageStatsFilename)
+	persistPathMu.Lock()
+	defer persistPathMu.Unlock()
+	persistPath = path
+}
+
+// LoadStatistics loads usage statistics from the persistence file.
+func LoadStatistics() {
+	persistPathMu.RLock()
+	defer persistPathMu.RUnlock()
+	if persistPath == "" {
+		return
+	}
+	data, err := os.ReadFile(persistPath)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Warnf("usage: failed to load statistics: %v", err)
+		}
+		return
+	}
+	var snapshot StatisticsSnapshot
+	if err := json.Unmarshal(data, &snapshot); err != nil {
+		log.Warnf("usage: failed to parse statistics: %v", err)
+		return
+	}
+	result := defaultRequestStatistics.MergeSnapshot(snapshot)
+	log.Infof("usage: loaded statistics (added=%d, skipped=%d)", result.Added, result.Skipped)
+}
+
+// SaveStatistics persists usage statistics to the file.
+func SaveStatistics() {
+	persistPathMu.RLock()
+	defer persistPathMu.RUnlock()
+	if persistPath == "" {
+		return
+	}
+	snapshot := defaultRequestStatistics.Snapshot()
+	data, err := json.Marshal(snapshot)
+	if err != nil {
+		log.Warnf("usage: failed to serialize statistics: %v", err)
+		return
+	}
+	if err := writeFileAtomic(persistPath, data, usageStatsFileMode); err != nil {
+		log.Warnf("usage: failed to save statistics: %v", err)
+		return
+	}
+	log.Infof("usage: saved statistics (requests=%d)", snapshot.TotalRequests)
+}
+
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	base := filepath.Base(path)
+
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+
+	tmpFile, err := os.CreateTemp(dir, base+".tmp-*")
+	if err != nil {
+		return err
+	}
+
+	tmpPath := tmpFile.Name()
+	renamed := false
+	closed := false
+	defer func() {
+		if !closed {
+			_ = tmpFile.Close()
+		}
+		if !renamed {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	if err := tmpFile.Chmod(perm); err != nil {
+		return err
+	}
+	if _, err := tmpFile.Write(data); err != nil {
+		return err
+	}
+	if err := tmpFile.Sync(); err != nil {
+		return err
+	}
+	if err := tmpFile.Close(); err != nil {
+		return err
+	}
+	closed = true
+
+	if err := os.Rename(tmpPath, path); err != nil {
+		return err
+	}
+
+	renamed = true
+	return nil
 }
