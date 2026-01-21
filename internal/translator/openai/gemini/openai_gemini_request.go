@@ -112,17 +112,21 @@ func ConvertGeminiRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 	}
 	if systemInstruction.Exists() {
 		parts := systemInstruction.Get("parts")
-		msg := `{"role":"system","content":[]}`
-		hasContent := false
+		msg := `{"role":"system","content":""}`
+		var textBuilder strings.Builder
+		hasText := false
+		hasNonText := false
+		contentWrapper := `{"arr":[]}`
 
 		if parts.Exists() && parts.IsArray() {
 			parts.ForEach(func(_, part gjson.Result) bool {
 				// Handle text parts
 				if text := part.Get("text"); text.Exists() {
+					textBuilder.WriteString(text.String())
 					contentPart := `{"type":"text","text":""}`
 					contentPart, _ = sjson.Set(contentPart, "text", text.String())
-					msg, _ = sjson.SetRaw(msg, "content.-1", contentPart)
-					hasContent = true
+					contentWrapper, _ = sjson.SetRaw(contentWrapper, "arr.-1", contentPart)
+					hasText = true
 				}
 
 				// Handle inline data (e.g., images)
@@ -136,14 +140,20 @@ func ConvertGeminiRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 
 					contentPart := `{"type":"image_url","image_url":{"url":""}}`
 					contentPart, _ = sjson.Set(contentPart, "image_url.url", imageURL)
-					msg, _ = sjson.SetRaw(msg, "content.-1", contentPart)
-					hasContent = true
+					contentWrapper, _ = sjson.SetRaw(contentWrapper, "arr.-1", contentPart)
+					hasNonText = true
 				}
 				return true
 			})
 		}
 
-		if hasContent {
+		if hasText || hasNonText {
+			// Use string format for text-only content, array format for multimodal
+			if hasNonText {
+				msg, _ = sjson.SetRaw(msg, "content", gjson.Get(contentWrapper, "arr").Raw)
+			} else {
+				msg, _ = sjson.Set(msg, "content", textBuilder.String())
+			}
 			out, _ = sjson.SetRaw(out, "messages.-1", msg)
 		}
 	}
