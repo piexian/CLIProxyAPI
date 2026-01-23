@@ -489,7 +489,7 @@ func SetPersistPath(configPath string) {
 	if configPath == "" {
 		return
 	}
-	path := filepath.Join(filepath.Dir(configPath), usageStatsFilename)
+	path := filepath.Join(filepath.Dir(configPath), "data", usageStatsFilename)
 	persistPathMu.Lock()
 	defer persistPathMu.Unlock()
 	persistPath = path

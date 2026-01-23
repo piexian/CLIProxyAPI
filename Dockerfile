@@ -24,8 +24,8 @@ COPY --from=builder ./app/CLIProxyAPIPlus /CLIProxyAPI/CLIProxyAPIPlus
 
 COPY config.example.yaml /CLIProxyAPI/config.example.yaml
 
-# Pre-create usage_stats.json with write permissions for persistence
-RUN touch /CLIProxyAPI/usage_stats.json && chmod 666 /CLIProxyAPI/usage_stats.json
+# Pre-create data directory for usage statistics persistence
+RUN mkdir -p /CLIProxyAPI/data && chmod 755 /CLIProxyAPI/data
 
 WORKDIR /CLIProxyAPI
 
