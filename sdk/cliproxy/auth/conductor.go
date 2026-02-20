@@ -1839,6 +1839,10 @@ func (m *Manager) StartAutoRefresh(parent context.Context, interval time.Duratio
 	}
 	ctx, cancel := context.WithCancel(parent)
 	m.refreshCancel = cancel
+
+	// Force refresh all iflow auths on startup.
+	m.forceRefreshProvider(ctx, "iflow")
+
 	go func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
@@ -1852,6 +1856,26 @@ func (m *Manager) StartAutoRefresh(parent context.Context, interval time.Duratio
 			}
 		}
 	}()
+}
+
+// forceRefreshProvider forces an immediate refresh for all auths of the given provider,
+// bypassing the normal shouldRefresh check.
+func (m *Manager) forceRefreshProvider(ctx context.Context, provider string) {
+	snapshot := m.snapshotAuths()
+	for _, a := range snapshot {
+		if a.Disabled || strings.ToLower(a.Provider) != provider {
+			continue
+		}
+		typ, _ := a.AccountInfo()
+		if typ == "api_key" {
+			continue
+		}
+		if exec := m.executorFor(a.Provider); exec == nil {
+			continue
+		}
+		log.Infof("startup: force refreshing %s auth %s", provider, a.ID)
+		go m.refreshAuth(ctx, a.ID)
+	}
 }
 
 // StopAutoRefresh cancels the background refresh loop, if running.
