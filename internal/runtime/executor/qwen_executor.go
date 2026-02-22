@@ -145,9 +145,12 @@ func isQwenQuotaError(body []byte) bool {
 
 // wrapQwenError wraps an HTTP error response, detecting quota errors and mapping them to 429.
 // Returns the appropriate status code and retryAfter duration for statusErr.
+// Only checks for quota errors when httpCode is 403 or 429 to avoid false positives.
 func wrapQwenError(ctx context.Context, httpCode int, body []byte) (errCode int, retryAfter *time.Duration) {
 	errCode = httpCode
-	if isQwenQuotaError(body) {
+	// Only check quota errors for expected status codes to avoid false positives
+	// Qwen returns 403 for quota errors, 429 for rate limits
+	if (httpCode == http.StatusForbidden || httpCode == http.StatusTooManyRequests) && isQwenQuotaError(body) {
 		errCode = http.StatusTooManyRequests // Map to 429 to trigger quota logic
 		cooldown := timeUntilNextDay()
 		retryAfter = &cooldown
