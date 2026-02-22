@@ -28,10 +28,21 @@ const (
 	qwenRateLimitWindow = time.Minute // sliding window duration
 )
 
+// qwenBeijingLoc caches the Beijing timezone to avoid repeated LoadLocation syscalls.
+var qwenBeijingLoc = func() *time.Location {
+	loc, err := time.LoadLocation("Asia/Shanghai")
+	if err != nil || loc == nil {
+		log.Warnf("qwen: failed to load Asia/Shanghai timezone: %v, using fixed UTC+8", err)
+		return time.FixedZone("CST", 8*3600)
+	}
+	return loc
+}()
+
 // qwenRateLimiter tracks request timestamps per credential for rate limiting.
 // Qwen has a limit of 60 requests per minute per account.
+// Uses sync.RWMutex for better read concurrency.
 var qwenRateLimiter = struct {
-	sync.Mutex
+	sync.RWMutex
 	requests map[string][]time.Time // authID -> request timestamps
 }{
 	requests: make(map[string][]time.Time),
@@ -42,8 +53,8 @@ var qwenRateLimiter = struct {
 func checkQwenRateLimit(authID string) error {
 	if authID == "" {
 		// Empty authID should not bypass rate limiting in production
-		// Log warning but allow the request (auth layer should handle this)
-		log.Warn("qwen rate limit check: empty authID, skipping rate limit")
+		// Use debug level to avoid log spam for certain auth flows
+		log.Debug("qwen rate limit check: empty authID, skipping rate limit")
 		return nil
 	}
 
@@ -62,12 +73,10 @@ func checkQwenRateLimit(authID string) error {
 		}
 	}
 
-	// Clean up empty entries to prevent memory leak
+	// Always prune expired entries to prevent memory leak
+	// Delete empty entries, otherwise update with pruned slice
 	if len(validTimestamps) == 0 {
 		delete(qwenRateLimiter.requests, authID)
-		validTimestamps = append(validTimestamps, now)
-		qwenRateLimiter.requests[authID] = validTimestamps
-		return nil
 	}
 
 	// Check if rate limit exceeded
@@ -86,7 +95,7 @@ func checkQwenRateLimit(authID string) error {
 		}
 	}
 
-	// Record this request
+	// Record this request and update the map with pruned timestamps
 	validTimestamps = append(validTimestamps, now)
 	qwenRateLimiter.requests[authID] = validTimestamps
 
@@ -121,14 +130,8 @@ func isQwenQuotaError(body []byte) bool {
 // Qwen's daily quota resets at 00:00 Beijing time.
 func timeUntilNextDay() time.Duration {
 	now := time.Now()
-	// Use UTC+8 Beijing time (Alibaba Cloud quota reset timezone)
-	loc, err := time.LoadLocation("Asia/Shanghai")
-	if err != nil || loc == nil {
-		log.Warnf("qwen: failed to load Asia/Shanghai timezone: %v, using fixed UTC+8", err)
-		loc = time.FixedZone("CST", 8*3600)
-	}
-	nowLocal := now.In(loc)
-	tomorrow := time.Date(nowLocal.Year(), nowLocal.Month(), nowLocal.Day()+1, 0, 0, 0, 0, loc)
+	nowLocal := now.In(qwenBeijingLoc)
+	tomorrow := time.Date(nowLocal.Year(), nowLocal.Month(), nowLocal.Day()+1, 0, 0, 0, 0, qwenBeijingLoc)
 	return tomorrow.Sub(now)
 }
 
