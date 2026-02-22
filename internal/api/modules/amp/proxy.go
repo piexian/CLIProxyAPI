@@ -199,12 +199,15 @@ func createReverseProxy(upstreamURL string, secretSource SecretSource) (*httputi
 
 	// Error handler for proxy failures with detailed error classification for diagnostics
 	proxy.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, err error) {
+		// Client-side cancellations are common during polling; suppress response in this case
+		if errors.Is(err, context.Canceled) {
+			return
+		}
+
 		// Classify the error type for better diagnostics
 		var errType string
 		if errors.Is(err, context.DeadlineExceeded) {
 			errType = "timeout"
-		} else if errors.Is(err, context.Canceled) {
-			errType = "canceled"
 		} else if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 			errType = "dial_timeout"
 		} else if _, ok := err.(net.Error); ok {
@@ -213,12 +216,7 @@ func createReverseProxy(upstreamURL string, secretSource SecretSource) (*httputi
 			errType = "connection_error"
 		}
 
-		// Don't log as error for context canceled - it's usually client closing connection
-		if errors.Is(err, context.Canceled) {
-			log.Debugf("amp upstream proxy [%s]: client canceled request for %s %s", errType, req.Method, req.URL.Path)
-		} else {
-			log.Errorf("amp upstream proxy error [%s] for %s %s: %v", errType, req.Method, req.URL.Path, err)
-		}
+		log.Errorf("amp upstream proxy error [%s] for %s %s: %v", errType, req.Method, req.URL.Path, err)
 
 		rw.Header().Set("Content-Type", "application/json")
 		rw.WriteHeader(http.StatusBadGateway)
