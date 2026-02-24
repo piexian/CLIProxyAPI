@@ -15,7 +15,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor"
-	_ "github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
+	internalusage "github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/watcher"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/wsrelay"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
@@ -416,6 +416,10 @@ func (s *Service) ensureExecutorsForAuthWithMode(a *coreauth.Auth, forceReplace 
 		s.coreManager.RegisterExecutor(executor.NewQwenExecutor(s.cfg))
 	case "iflow":
 		s.coreManager.RegisterExecutor(executor.NewIFlowExecutor(s.cfg))
+	case "kiro":
+		s.coreManager.RegisterExecutor(executor.NewKiroExecutor(s.cfg))
+	case "github-copilot":
+		s.coreManager.RegisterExecutor(executor.NewGitHubCopilotExecutor(s.cfg))
 	case "kimi":
 		s.coreManager.RegisterExecutor(executor.NewKimiExecutor(s.cfg))
 	default:
@@ -461,6 +465,11 @@ func (s *Service) Run(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+
+	// Initialize and load persisted usage statistics before usage tracking starts,
+	// restoring previously accumulated metrics so they continue across restarts.
+	internalusage.SetPersistPath(s.configPath)
+	internalusage.LoadStatistics()
 
 	usage.StartDefault(ctx)
 
@@ -696,6 +705,9 @@ func (s *Service) Shutdown(ctx context.Context) error {
 
 		// no legacy clients to persist
 
+		// Persist usage statistics before shutdown.
+		internalusage.SaveStatistics()
+
 		if s.server != nil {
 			shutdownCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 			defer cancel()
@@ -832,6 +844,11 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 		models = applyExcludedModels(models, excluded)
 	case "iflow":
 		models = registry.GetIFlowModels()
+	case "github-copilot":
+		models = registry.GetGitHubCopilotModels()
+		models = applyExcludedModels(models, excluded)
+	case "kiro":
+		models = registry.GetKiroModels()
 		models = applyExcludedModels(models, excluded)
 	case "kimi":
 		models = registry.GetKimiModels()

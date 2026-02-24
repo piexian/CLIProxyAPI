@@ -61,7 +61,7 @@ type RefreshEvaluator interface {
 const (
 	refreshCheckInterval  = 5 * time.Second
 	refreshPendingBackoff = time.Minute
-	refreshFailureBackoff = 5 * time.Minute
+	refreshFailureBackoff = 1 * time.Minute
 	quotaBackoffBase      = time.Second
 	quotaBackoffMax       = 30 * time.Minute
 )
@@ -1894,6 +1894,10 @@ func (m *Manager) StartAutoRefresh(parent context.Context, interval time.Duratio
 	}
 	ctx, cancel := context.WithCancel(parent)
 	m.refreshCancel = cancel
+
+	// Force refresh all iflow auths on startup.
+	m.forceRefreshProvider(ctx, "iflow")
+
 	go func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
@@ -1907,6 +1911,26 @@ func (m *Manager) StartAutoRefresh(parent context.Context, interval time.Duratio
 			}
 		}
 	}()
+}
+
+// forceRefreshProvider forces an immediate refresh for all auths of the given provider,
+// bypassing the normal shouldRefresh check.
+func (m *Manager) forceRefreshProvider(ctx context.Context, provider string) {
+	snapshot := m.snapshotAuths()
+	for _, a := range snapshot {
+		if a.Disabled || strings.ToLower(a.Provider) != provider {
+			continue
+		}
+		typ, _ := a.AccountInfo()
+		if typ == "api_key" {
+			continue
+		}
+		if exec := m.executorFor(a.Provider); exec == nil {
+			continue
+		}
+		log.Infof("startup: force refreshing %s auth %s", provider, a.ID)
+		go m.refreshAuth(ctx, a.ID)
+	}
 }
 
 // StopAutoRefresh cancels the background refresh loop, if running.
@@ -2211,7 +2235,9 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 		updated.Runtime = auth.Runtime
 	}
 	updated.LastRefreshedAt = now
-	updated.NextRefreshAfter = time.Time{}
+	// Preserve NextRefreshAfter set by the Authenticator
+	// If the Authenticator set a reasonable refresh time, it should not be overwritten
+	// If the Authenticator did not set it (zero value), shouldRefresh will use default logic
 	updated.LastError = nil
 	updated.UpdatedAt = now
 	_, _ = m.Update(ctx, updated)

@@ -1,6 +1,6 @@
 services:
   cli-proxy-api:
-    image: ${CLI_PROXY_IMAGE:-eceasy/cli-proxy-api:latest}
+    image: ${CLI_PROXY_IMAGE:-ghcr.io/piexian/cli-proxy-api:latest}
     pull_policy: always
     build:
       context: .
@@ -9,7 +9,7 @@ services:
         VERSION: ${VERSION:-dev}
         COMMIT: ${COMMIT:-none}
         BUILD_DATE: ${BUILD_DATE:-unknown}
-    container_name: cli-proxy-api
+    container_name: cli-proxy-api-plus
     # env_file:
     #   - .env
     environment:
@@ -25,4 +25,5 @@ services:
       - ${CLI_PROXY_CONFIG_PATH:-./config.yaml}:/CLIProxyAPI/config.yaml
       - ${CLI_PROXY_AUTH_PATH:-./auths}:/root/.cli-proxy-api
       - ${CLI_PROXY_LOG_PATH:-./logs}:/CLIProxyAPI/logs
+      - ${CLI_PROXY_DATA_PATH:-./data}:/CLIProxyAPI/data
     restart: unless-stopped

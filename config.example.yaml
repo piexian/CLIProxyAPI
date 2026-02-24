@@ -48,6 +48,11 @@ pprof:
 # When true, disable high-overhead HTTP middleware features to reduce per-request memory usage under high concurrency.
 commercial-mode: false
 
+# Open OAuth URLs in incognito/private browser mode.
+# Useful when you want to login with a different account without logging out from your current session.
+# Default: false (but Kiro auth defaults to true for multi-account support)
+incognito-browser: true
+
 # When true, write application logs to rotating files instead of stdout
 logging-to-file: false
 
@@ -160,6 +165,16 @@ nonstream-keepalive-interval: 0
 #         - "API"
 #         - "proxy"
 #       cache-user-id: true          # optional: default is false; set true to reuse cached user_id per API key instead of generating a random one each request
+
+# Kiro (AWS CodeWhisperer) configuration
+# Note: Kiro API currently only operates in us-east-1 region
+#kiro:
+#  - token-file: "~/.aws/sso/cache/kiro-auth-token.json" # path to Kiro token file
+#    agent-task-type: "" # optional: "vibe" or empty (API default)
+#  - access-token: "aoaAAAAA..." # or provide tokens directly
+#    refresh-token: "aorAAAAA..."
+#    profile-arn: "arn:aws:codewhisperer:us-east-1:..."
+#    proxy-url: "socks5://proxy.example.com:1080" # optional: proxy override
 
 # Default headers for Claude API requests. Update when Claude Code releases new versions.
 # These are used as fallbacks when the client does not send its own headers.
