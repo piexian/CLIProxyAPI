@@ -290,6 +290,9 @@ func (s *Service) applyCoreAuthAddOrUpdate(ctx context.Context, auth *coreauth.A
 		auth.CreatedAt = existing.CreatedAt
 		auth.LastRefreshedAt = existing.LastRefreshedAt
 		auth.NextRefreshAfter = existing.NextRefreshAfter
+		if len(auth.ModelStates) == 0 && len(existing.ModelStates) > 0 {
+			auth.ModelStates = existing.ModelStates
+		}
 		op = "update"
 		_, err = s.coreManager.Update(ctx, auth)
 	} else {
@@ -309,6 +312,12 @@ func (s *Service) applyCoreAuthAddOrUpdate(ctx context.Context, auth *coreauth.A
 	// This operation may block on network calls, but the auth configuration
 	// is already effective at this point.
 	s.registerModelsForAuth(auth)
+
+	// Refresh the scheduler entry so that the auth's supportedModelSet is rebuilt
+	// from the now-populated global model registry. Without this, newly added auths
+	// have an empty supportedModelSet (because Register/Update upserts into the
+	// scheduler before registerModelsForAuth runs) and are invisible to the scheduler.
+	s.coreManager.RefreshSchedulerEntry(auth.ID)
 }
 
 func (s *Service) applyCoreAuthRemoval(ctx context.Context, id string) {
@@ -800,9 +809,12 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 	case "vertex":
 		// Vertex AI Gemini supports the same model identifiers as Gemini.
 		models = registry.GetGeminiVertexModels()
-		if authKind == "apikey" {
-			if entry := s.resolveConfigVertexCompatKey(a); entry != nil && len(entry.Models) > 0 {
+		if entry := s.resolveConfigVertexCompatKey(a); entry != nil {
+			if len(entry.Models) > 0 {
 				models = buildVertexCompatConfigModels(entry)
+			}
+			if authKind == "apikey" {
+				excluded = entry.ExcludedModels
 			}
 		}
 		models = applyExcludedModels(models, excluded)
@@ -829,7 +841,22 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 		}
 		models = applyExcludedModels(models, excluded)
 	case "codex":
-		models = registry.GetOpenAIModels()
+		codexPlanType := ""
+		if a.Attributes != nil {
+			codexPlanType = strings.TrimSpace(a.Attributes["plan_type"])
+		}
+		switch strings.ToLower(codexPlanType) {
+		case "pro":
+			models = registry.GetCodexProModels()
+		case "plus":
+			models = registry.GetCodexPlusModels()
+		case "team":
+			models = registry.GetCodexTeamModels()
+		case "free":
+			models = registry.GetCodexFreeModels()
+		default:
+			models = registry.GetCodexProModels()
+		}
 		if entry := s.resolveConfigCodexKey(a); entry != nil {
 			if len(entry.Models) > 0 {
 				models = buildCodexConfigModels(entry)
