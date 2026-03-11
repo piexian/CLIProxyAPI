@@ -26,6 +26,8 @@ const (
 	qwenUserAgent       = "QwenCode/0.10.3 (darwin; arm64)"
 	qwenRateLimitPerMin = 60          // 60 requests per minute per credential
 	qwenRateLimitWindow = time.Minute // sliding window duration
+	qwenDailyLimit      = 1000        // Qwen Code OAuth: 1000 requests per day per credential
+	qwenRateCooldown    = 5 * time.Minute // cooldown for RPM/burst rate limit errors
 )
 
 // qwenBeijingLoc caches the Beijing timezone to avoid repeated LoadLocation syscalls.
@@ -44,13 +46,36 @@ var qwenQuotaCodes = map[string]struct{}{
 	"quota_exceeded":     {},
 }
 
+// qwenRateLimitMessages identifies RPM/RPS rate limit errors (recoverable in ~1 minute).
+// These are distinct from daily quota exhaustion errors which require next-day recovery.
+var qwenRateLimitMessages = []string{
+	"requests rate limit exceeded",
+	"you exceeded your current requests",
+	"request rate increased too quickly",
+}
+
 // qwenRateLimiter tracks request timestamps per credential for rate limiting.
-// Qwen has a limit of 60 requests per minute per account.
+// Qwen Code OAuth has a limit of 60 requests per minute per account.
 var qwenRateLimiter = struct {
 	sync.Mutex
 	requests map[string][]time.Time // authID -> request timestamps
 }{
 	requests: make(map[string][]time.Time),
+}
+
+// qwenDailyCount tracks the number of requests per day (Beijing time) for a credential.
+type qwenDailyCount struct {
+	date  string // "2006-01-02" in Beijing time
+	count int
+}
+
+// qwenDailyCounter tracks daily request counts per credential.
+// Qwen Code OAuth has a limit of 1000 requests per day per account.
+var qwenDailyCounter = struct {
+	sync.Mutex
+	counts map[string]*qwenDailyCount // authID -> daily count
+}{
+	counts: make(map[string]*qwenDailyCount),
 }
 
 // redactAuthID returns a redacted version of the auth ID for safe logging.
@@ -119,7 +144,63 @@ func checkQwenRateLimit(authID string) error {
 	return nil
 }
 
-// isQwenQuotaError checks if the error response indicates a quota exceeded error.
+// checkQwenDailyLimit checks if the credential has exceeded the daily request limit.
+// Qwen Code OAuth allows 1000 requests per day, resetting at 00:00 Beijing time.
+// Returns nil if allowed, or a statusErr with retryAfter if the daily limit is reached.
+func checkQwenDailyLimit(authID string) error {
+	if authID == "" {
+		return nil
+	}
+
+	today := time.Now().In(qwenBeijingLoc).Format("2006-01-02")
+
+	qwenDailyCounter.Lock()
+	defer qwenDailyCounter.Unlock()
+
+	dc := qwenDailyCounter.counts[authID]
+
+	// Reset counter if the date has changed (new day in Beijing time)
+	if dc == nil || dc.date != today {
+		dc = &qwenDailyCount{date: today, count: 0}
+		qwenDailyCounter.counts[authID] = dc
+	}
+
+	if dc.count >= qwenDailyLimit {
+		cooldown := timeUntilNextDay()
+		return statusErr{
+			code:       http.StatusTooManyRequests,
+			msg:        fmt.Sprintf(`{"error":{"code":"insufficient_quota","message":"Qwen daily limit: %d requests/day exceeded, retry after %s","type":"insufficient_quota"}}`, qwenDailyLimit, cooldown.Truncate(time.Second)),
+			retryAfter: &cooldown,
+		}
+	}
+
+	dc.count++
+	return nil
+}
+
+// markQwenDailyExhausted sets the daily counter for a credential to the limit,
+// so that subsequent requests are immediately blocked. Called when the upstream
+// confirms quota exhaustion via an insufficient_quota error response.
+func markQwenDailyExhausted(authID string) {
+	if authID == "" {
+		return
+	}
+
+	today := time.Now().In(qwenBeijingLoc).Format("2006-01-02")
+
+	qwenDailyCounter.Lock()
+	defer qwenDailyCounter.Unlock()
+
+	dc := qwenDailyCounter.counts[authID]
+	if dc == nil || dc.date != today {
+		dc = &qwenDailyCount{date: today}
+		qwenDailyCounter.counts[authID] = dc
+	}
+	dc.count = qwenDailyLimit
+	log.Warnf("qwen: credential %s marked as daily quota exhausted", redactAuthID(authID))
+}
+
+// isQwenQuotaError checks if the error response indicates a daily quota exhaustion error.
 // Qwen returns HTTP 403 with error.code="insufficient_quota" when daily quota is exhausted.
 func isQwenQuotaError(body []byte) bool {
 	code := strings.ToLower(gjson.GetBytes(body, "error.code").String())
@@ -136,26 +217,66 @@ func isQwenQuotaError(body []byte) bool {
 	// Fallback: check message only if code/type don't match (less reliable)
 	msg := strings.ToLower(gjson.GetBytes(body, "error.message").String())
 	if strings.Contains(msg, "insufficient_quota") || strings.Contains(msg, "quota exceeded") ||
-		strings.Contains(msg, "free allocated quota exceeded") {
+		strings.Contains(msg, "allocated quota exceeded") {
 		return true
 	}
 
 	return false
 }
 
-// wrapQwenError wraps an HTTP error response, detecting quota errors and mapping them to 429.
+// isQwenRateLimitError checks if the error response indicates a RPM/RPS rate limit
+// or a burst-rate stability protection error. These errors recover within ~1 minute,
+// unlike daily quota exhaustion which requires waiting until next day.
+func isQwenRateLimitError(body []byte) bool {
+	msg := strings.ToLower(gjson.GetBytes(body, "error.message").String())
+	for _, pattern := range qwenRateLimitMessages {
+		if strings.Contains(msg, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
+// wrapQwenError wraps an HTTP error response, detecting rate limit and quota errors.
+// It differentiates between:
+//   - RPM/burst rate limit errors → 60s cooldown (recovers within 1 minute)
+//   - Daily quota exhaustion errors → cooldown until next day (Beijing time 00:00)
+//   - Other 429 errors → conservative 60s cooldown
+//
 // Returns the appropriate status code and retryAfter duration for statusErr.
-// Only checks for quota errors when httpCode is 403 or 429 to avoid false positives.
 func wrapQwenError(ctx context.Context, httpCode int, body []byte) (errCode int, retryAfter *time.Duration) {
 	errCode = httpCode
-	// Only check quota errors for expected status codes to avoid false positives
-	// Qwen returns 403 for quota errors, 429 for rate limits
-	if (httpCode == http.StatusForbidden || httpCode == http.StatusTooManyRequests) && isQwenQuotaError(body) {
-		errCode = http.StatusTooManyRequests // Map to 429 to trigger quota logic
+
+	// Only inspect 403 and 429 responses to avoid false positives
+	if httpCode != http.StatusForbidden && httpCode != http.StatusTooManyRequests {
+		return errCode, retryAfter
+	}
+
+	// Priority 1: RPM/burst rate limit → short cooldown (~60s recovery)
+	if isQwenRateLimitError(body) {
+		errCode = http.StatusTooManyRequests
+		cooldown := qwenRateCooldown
+		retryAfter = &cooldown
+		logWithRequestID(ctx).Warnf("qwen rate limit hit (http %d -> %d), cooling down %v", httpCode, errCode, cooldown)
+		return errCode, retryAfter
+	}
+
+	// Priority 2: Daily quota exhaustion → cooldown until next day
+	if isQwenQuotaError(body) {
+		errCode = http.StatusTooManyRequests
 		cooldown := timeUntilNextDay()
 		retryAfter = &cooldown
-		logWithRequestID(ctx).Warnf("qwen quota exceeded (http %d -> %d), cooling down until tomorrow (%v)", httpCode, errCode, cooldown)
+		logWithRequestID(ctx).Warnf("qwen daily quota exceeded (http %d -> %d), cooling down until tomorrow (%v)", httpCode, errCode, cooldown)
+		return errCode, retryAfter
 	}
+
+	// Priority 3: Other 429 errors → conservative short cooldown
+	if httpCode == http.StatusTooManyRequests {
+		cooldown := qwenRateCooldown
+		retryAfter = &cooldown
+		logWithRequestID(ctx).Warnf("qwen unknown 429 error, cooling down %v", cooldown)
+	}
+
 	return errCode, retryAfter
 }
 
@@ -218,6 +339,10 @@ func (e *QwenExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 	}
 	if err := checkQwenRateLimit(authID); err != nil {
 		logWithRequestID(ctx).Warnf("qwen rate limit exceeded for credential %s", redactAuthID(authID))
+		return resp, err
+	}
+	if err := checkQwenDailyLimit(authID); err != nil {
+		logWithRequestID(ctx).Warnf("qwen daily limit exceeded for credential %s", redactAuthID(authID))
 		return resp, err
 	}
 
@@ -290,6 +415,9 @@ func (e *QwenExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 		appendAPIResponseChunk(ctx, e.cfg, b)
 
 		errCode, retryAfter := wrapQwenError(ctx, httpResp.StatusCode, b)
+		if isQwenQuotaError(b) {
+			markQwenDailyExhausted(authID)
+		}
 		logWithRequestID(ctx).Debugf("request error, error status: %d (mapped: %d), error message: %s", httpResp.StatusCode, errCode, summarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
 		err = statusErr{code: errCode, msg: string(b), retryAfter: retryAfter}
 		return resp, err
@@ -321,6 +449,10 @@ func (e *QwenExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 	}
 	if err := checkQwenRateLimit(authID); err != nil {
 		logWithRequestID(ctx).Warnf("qwen rate limit exceeded for credential %s", redactAuthID(authID))
+		return nil, err
+	}
+	if err := checkQwenDailyLimit(authID); err != nil {
+		logWithRequestID(ctx).Warnf("qwen daily limit exceeded for credential %s", redactAuthID(authID))
 		return nil, err
 	}
 
@@ -395,6 +527,9 @@ func (e *QwenExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 		appendAPIResponseChunk(ctx, e.cfg, b)
 
 		errCode, retryAfter := wrapQwenError(ctx, httpResp.StatusCode, b)
+		if isQwenQuotaError(b) {
+			markQwenDailyExhausted(authID)
+		}
 		logWithRequestID(ctx).Debugf("request error, error status: %d (mapped: %d), error message: %s", httpResp.StatusCode, errCode, summarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
 		if errClose := httpResp.Body.Close(); errClose != nil {
 			log.Errorf("qwen executor: close response body error: %v", errClose)
