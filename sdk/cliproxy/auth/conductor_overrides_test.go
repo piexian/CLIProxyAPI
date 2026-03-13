@@ -108,6 +108,68 @@ func (e *credentialRetryLimitExecutor) Calls() int {
 	return e.calls
 }
 
+type stopRotationTestError struct {
+	retryAfter time.Duration
+}
+
+func (e stopRotationTestError) Error() string { return "shared upstream cooldown" }
+func (e stopRotationTestError) StatusCode() int {
+	return http.StatusTooManyRequests
+}
+func (e stopRotationTestError) RetryAfter() *time.Duration {
+	retryAfter := e.retryAfter
+	return &retryAfter
+}
+func (e stopRotationTestError) StopCredentialRotation() bool {
+	return true
+}
+
+type stopRotationExecutor struct {
+	id string
+
+	mu    sync.Mutex
+	calls int
+}
+
+func (e *stopRotationExecutor) Identifier() string {
+	return e.id
+}
+
+func (e *stopRotationExecutor) Execute(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	e.recordCall()
+	return cliproxyexecutor.Response{}, stopRotationTestError{retryAfter: 5 * time.Minute}
+}
+
+func (e *stopRotationExecutor) ExecuteStream(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	e.recordCall()
+	return nil, stopRotationTestError{retryAfter: 5 * time.Minute}
+}
+
+func (e *stopRotationExecutor) Refresh(_ context.Context, auth *Auth) (*Auth, error) {
+	return auth, nil
+}
+
+func (e *stopRotationExecutor) CountTokens(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	e.recordCall()
+	return cliproxyexecutor.Response{}, stopRotationTestError{retryAfter: 5 * time.Minute}
+}
+
+func (e *stopRotationExecutor) HttpRequest(context.Context, *Auth, *http.Request) (*http.Response, error) {
+	return nil, nil
+}
+
+func (e *stopRotationExecutor) recordCall() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.calls++
+}
+
+func (e *stopRotationExecutor) Calls() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.calls
+}
+
 func newCredentialRetryLimitTestManager(t *testing.T, maxRetryCredentials int) (*Manager, *credentialRetryLimitExecutor) {
 	t.Helper()
 
@@ -125,6 +187,37 @@ func newCredentialRetryLimitTestManager(t *testing.T, maxRetryCredentials int) (
 	reg := registry.GetGlobalRegistry()
 	reg.RegisterClient(auth1.ID, "claude", []*registry.ModelInfo{{ID: "test-model"}})
 	reg.RegisterClient(auth2.ID, "claude", []*registry.ModelInfo{{ID: "test-model"}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(auth1.ID)
+		reg.UnregisterClient(auth2.ID)
+	})
+
+	if _, errRegister := m.Register(context.Background(), auth1); errRegister != nil {
+		t.Fatalf("register auth1: %v", errRegister)
+	}
+	if _, errRegister := m.Register(context.Background(), auth2); errRegister != nil {
+		t.Fatalf("register auth2: %v", errRegister)
+	}
+
+	return m, executor
+}
+
+func newStopRotationTestManager(t *testing.T) (*Manager, *stopRotationExecutor) {
+	t.Helper()
+
+	m := NewManager(nil, nil, nil)
+	m.SetRetryConfig(0, 0, 0)
+
+	executor := &stopRotationExecutor{id: "qwen"}
+	m.RegisterExecutor(executor)
+
+	baseID := uuid.NewString()
+	auth1 := &Auth{ID: baseID + "-auth-1", Provider: "qwen"}
+	auth2 := &Auth{ID: baseID + "-auth-2", Provider: "qwen"}
+
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(auth1.ID, "qwen", []*registry.ModelInfo{{ID: "qwen3.5-plus"}})
+	reg.RegisterClient(auth2.ID, "qwen", []*registry.ModelInfo{{ID: "qwen3.5-plus"}})
 	t.Cleanup(func() {
 		reg.UnregisterClient(auth1.ID)
 		reg.UnregisterClient(auth2.ID)
@@ -186,6 +279,53 @@ func TestManager_MaxRetryCredentials_LimitsCrossCredentialRetries(t *testing.T) 
 			}
 			if calls := unlimitedExecutor.Calls(); calls != 2 {
 				t.Fatalf("expected 2 calls with max-retry-credentials=0, got %d", calls)
+			}
+		})
+	}
+}
+
+func TestManager_StopCredentialRotation_PreventsCrossCredentialSweep(t *testing.T) {
+	request := cliproxyexecutor.Request{Model: "qwen3.5-plus"}
+	testCases := []struct {
+		name   string
+		invoke func(*Manager) error
+	}{
+		{
+			name: "execute",
+			invoke: func(m *Manager) error {
+				_, errExecute := m.Execute(context.Background(), []string{"qwen"}, request, cliproxyexecutor.Options{})
+				return errExecute
+			},
+		},
+		{
+			name: "execute_count",
+			invoke: func(m *Manager) error {
+				_, errExecute := m.ExecuteCount(context.Background(), []string{"qwen"}, request, cliproxyexecutor.Options{})
+				return errExecute
+			},
+		},
+		{
+			name: "execute_stream",
+			invoke: func(m *Manager) error {
+				_, errExecute := m.ExecuteStream(context.Background(), []string{"qwen"}, request, cliproxyexecutor.Options{})
+				return errExecute
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			m, executor := newStopRotationTestManager(t)
+			errInvoke := tc.invoke(m)
+			if errInvoke == nil {
+				t.Fatalf("expected error for stop-rotation execution")
+			}
+			if status := statusCodeFromError(errInvoke); status != http.StatusTooManyRequests {
+				t.Fatalf("status = %d, want %d", status, http.StatusTooManyRequests)
+			}
+			if calls := executor.Calls(); calls != 1 {
+				t.Fatalf("expected 1 call when StopCredentialRotation=true, got %d", calls)
 			}
 		})
 	}

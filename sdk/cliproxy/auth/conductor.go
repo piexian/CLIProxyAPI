@@ -562,7 +562,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: rerr}
 			result.RetryAfter = retryAfterFromError(errStream)
 			m.MarkResult(ctx, result)
-			if isRequestInvalidError(errStream) {
+			if isRequestInvalidError(errStream) || shouldStopCredentialRotation(errStream) {
 				return nil, errStream
 			}
 			lastErr = errStream
@@ -576,6 +576,17 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				return nil, errCtx
 			}
 			if isRequestInvalidError(bootstrapErr) {
+				rerr := &Error{Message: bootstrapErr.Error()}
+				if se, ok := errors.AsType[cliproxyexecutor.StatusError](bootstrapErr); ok && se != nil {
+					rerr.HTTPStatus = se.StatusCode()
+				}
+				result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: rerr}
+				result.RetryAfter = retryAfterFromError(bootstrapErr)
+				m.MarkResult(ctx, result)
+				discardStreamChunks(streamResult.Chunks)
+				return nil, bootstrapErr
+			}
+			if shouldStopCredentialRotation(bootstrapErr) {
 				rerr := &Error{Message: bootstrapErr.Error()}
 				if se, ok := errors.AsType[cliproxyexecutor.StatusError](bootstrapErr); ok && se != nil {
 					rerr.HTTPStatus = se.StatusCode()
@@ -1038,13 +1049,16 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 					return cliproxyexecutor.Response{}, errExec
 				}
 				authErr = errExec
+				if shouldStopCredentialRotation(errExec) {
+					break
+				}
 				continue
 			}
 			m.MarkResult(execCtx, result)
 			return resp, nil
 		}
 		if authErr != nil {
-			if isRequestInvalidError(authErr) {
+			if isRequestInvalidError(authErr) || shouldStopCredentialRotation(authErr) {
 				return cliproxyexecutor.Response{}, authErr
 			}
 			lastErr = authErr
@@ -1110,13 +1124,16 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 					return cliproxyexecutor.Response{}, errExec
 				}
 				authErr = errExec
+				if shouldStopCredentialRotation(errExec) {
+					break
+				}
 				continue
 			}
 			m.hook.OnResult(execCtx, result)
 			return resp, nil
 		}
 		if authErr != nil {
-			if isRequestInvalidError(authErr) {
+			if isRequestInvalidError(authErr) || shouldStopCredentialRotation(authErr) {
 				return cliproxyexecutor.Response{}, authErr
 			}
 			lastErr = authErr
@@ -1163,7 +1180,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			if errCtx := execCtx.Err(); errCtx != nil {
 				return nil, errCtx
 			}
-			if isRequestInvalidError(errStream) {
+			if isRequestInvalidError(errStream) || shouldStopCredentialRotation(errStream) {
 				return nil, errStream
 			}
 			lastErr = errStream
@@ -1929,6 +1946,20 @@ func retryAfterFromError(err error) *time.Duration {
 		return nil
 	}
 	return new(*retryAfter)
+}
+
+func shouldStopCredentialRotation(err error) bool {
+	if err == nil {
+		return false
+	}
+	type rotationStopper interface {
+		StopCredentialRotation() bool
+	}
+	var stopper rotationStopper
+	if !errors.As(err, &stopper) || stopper == nil {
+		return false
+	}
+	return stopper.StopCredentialRotation()
 }
 
 func statusCodeFromResult(err *Error) int {

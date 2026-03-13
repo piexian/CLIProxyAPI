@@ -181,7 +181,7 @@ func TestWrapQwenErrorDifferentiation(t *testing.T) {
 
 	t.Run("RPM rate limit gets short cooldown", func(t *testing.T) {
 		body := []byte(`{"error":{"code":"rate_limit_exceeded","message":"Requests rate limit exceeded","type":"rate_limit_exceeded"}}`)
-		errCode, retryAfter := wrapQwenError(ctx, http.StatusTooManyRequests, body)
+		errCode, retryAfter, stopRotation := wrapQwenError(ctx, http.StatusTooManyRequests, body)
 
 		if errCode != http.StatusTooManyRequests {
 			t.Errorf("errCode = %d, want %d", errCode, http.StatusTooManyRequests)
@@ -191,12 +191,15 @@ func TestWrapQwenErrorDifferentiation(t *testing.T) {
 		}
 		if *retryAfter != qwenRateCooldown {
 			t.Errorf("retryAfter = %v, want %v", *retryAfter, qwenRateCooldown)
+		}
+		if !stopRotation {
+			t.Fatal("stopRotation = false, want true")
 		}
 	})
 
 	t.Run("burst rate error gets short cooldown", func(t *testing.T) {
 		body := []byte(`{"error":{"code":"stability","message":"Request rate increased too quickly","type":"rate_limit"}}`)
-		errCode, retryAfter := wrapQwenError(ctx, http.StatusTooManyRequests, body)
+		errCode, retryAfter, stopRotation := wrapQwenError(ctx, http.StatusTooManyRequests, body)
 
 		if errCode != http.StatusTooManyRequests {
 			t.Errorf("errCode = %d, want %d", errCode, http.StatusTooManyRequests)
@@ -206,12 +209,15 @@ func TestWrapQwenErrorDifferentiation(t *testing.T) {
 		}
 		if *retryAfter != qwenRateCooldown {
 			t.Errorf("retryAfter = %v, want %v", *retryAfter, qwenRateCooldown)
+		}
+		if !stopRotation {
+			t.Fatal("stopRotation = false, want true")
 		}
 	})
 
 	t.Run("generic quota signal gets short cooldown", func(t *testing.T) {
 		body := []byte(`{"error":{"code":"insufficient_quota","message":"You exceeded your current quota","type":"insufficient_quota"}}`)
-		errCode, retryAfter := wrapQwenError(ctx, http.StatusForbidden, body)
+		errCode, retryAfter, stopRotation := wrapQwenError(ctx, http.StatusForbidden, body)
 
 		if errCode != http.StatusTooManyRequests {
 			t.Errorf("errCode = %d, want %d", errCode, http.StatusTooManyRequests)
@@ -222,11 +228,14 @@ func TestWrapQwenErrorDifferentiation(t *testing.T) {
 		if *retryAfter != qwenRateCooldown {
 			t.Errorf("retryAfter = %v, want %v", *retryAfter, qwenRateCooldown)
 		}
+		if !stopRotation {
+			t.Fatal("stopRotation = false, want true")
+		}
 	})
 
 	t.Run("daily quota exhaustion gets next-day cooldown", func(t *testing.T) {
 		body := []byte(`{"error":{"code":"insufficient_quota","message":"Daily quota exceeded, please try again tomorrow","type":"insufficient_quota"}}`)
-		errCode, retryAfter := wrapQwenError(ctx, http.StatusForbidden, body)
+		errCode, retryAfter, stopRotation := wrapQwenError(ctx, http.StatusForbidden, body)
 
 		if errCode != http.StatusTooManyRequests {
 			t.Errorf("errCode = %d, want %d", errCode, http.StatusTooManyRequests)
@@ -237,11 +246,14 @@ func TestWrapQwenErrorDifferentiation(t *testing.T) {
 		if *retryAfter <= qwenRateCooldown {
 			t.Errorf("retryAfter = %v, expected to be significantly longer than %v for daily quota", *retryAfter, qwenRateCooldown)
 		}
+		if stopRotation {
+			t.Fatal("stopRotation = true, want false")
+		}
 	})
 
 	t.Run("unknown 429 gets short cooldown", func(t *testing.T) {
 		body := []byte(`{"error":{"code":"unknown","message":"some unknown error","type":"unknown"}}`)
-		errCode, retryAfter := wrapQwenError(ctx, http.StatusTooManyRequests, body)
+		errCode, retryAfter, stopRotation := wrapQwenError(ctx, http.StatusTooManyRequests, body)
 
 		if errCode != http.StatusTooManyRequests {
 			t.Errorf("errCode = %d, want %d", errCode, http.StatusTooManyRequests)
@@ -252,17 +264,23 @@ func TestWrapQwenErrorDifferentiation(t *testing.T) {
 		if *retryAfter != qwenRateCooldown {
 			t.Errorf("retryAfter = %v, want %v", *retryAfter, qwenRateCooldown)
 		}
+		if !stopRotation {
+			t.Fatal("stopRotation = false, want true")
+		}
 	})
 
 	t.Run("non-429 non-403 is not modified", func(t *testing.T) {
 		body := []byte(`{"error":{"code":"bad_request","message":"Invalid input","type":"invalid_request"}}`)
-		errCode, retryAfter := wrapQwenError(ctx, http.StatusBadRequest, body)
+		errCode, retryAfter, stopRotation := wrapQwenError(ctx, http.StatusBadRequest, body)
 
 		if errCode != http.StatusBadRequest {
 			t.Errorf("errCode = %d, want %d", errCode, http.StatusBadRequest)
 		}
 		if retryAfter != nil {
 			t.Errorf("retryAfter = %v, want nil", *retryAfter)
+		}
+		if stopRotation {
+			t.Fatal("stopRotation = true, want false")
 		}
 	})
 }
