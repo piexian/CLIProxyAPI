@@ -85,6 +85,49 @@ func TestIsQwenQuotaError(t *testing.T) {
 	}
 }
 
+func TestIsQwenDailyQuotaError(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want bool
+	}{
+		{
+			"generic insufficient_quota is not daily",
+			`{"error":{"code":"insufficient_quota","message":"You exceeded your current quota","type":"insufficient_quota"}}`,
+			false,
+		},
+		{
+			"daily quota message matches",
+			`{"error":{"code":"insufficient_quota","message":"Daily quota exceeded, please try again tomorrow","type":"insufficient_quota"}}`,
+			true,
+		},
+		{
+			"daily limit wording matches",
+			`{"error":{"code":"quota_exceeded","message":"Daily limit reached for today","type":"quota_exceeded"}}`,
+			true,
+		},
+		{
+			"rate limit error stays false",
+			`{"error":{"code":"rate_limit_exceeded","message":"Requests rate limit exceeded","type":"rate_limit_exceeded"}}`,
+			false,
+		},
+		{
+			"empty body",
+			`{}`,
+			false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isQwenDailyQuotaError([]byte(tt.body))
+			if got != tt.want {
+				t.Errorf("isQwenDailyQuotaError(%q) = %v, want %v", tt.body, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestIsQwenRateLimitError(t *testing.T) {
 	tests := []struct {
 		name string
@@ -166,7 +209,7 @@ func TestWrapQwenErrorDifferentiation(t *testing.T) {
 		}
 	})
 
-	t.Run("daily quota exhaustion gets next-day cooldown", func(t *testing.T) {
+	t.Run("generic quota signal gets short cooldown", func(t *testing.T) {
 		body := []byte(`{"error":{"code":"insufficient_quota","message":"You exceeded your current quota","type":"insufficient_quota"}}`)
 		errCode, retryAfter := wrapQwenError(ctx, http.StatusForbidden, body)
 
@@ -176,7 +219,21 @@ func TestWrapQwenErrorDifferentiation(t *testing.T) {
 		if retryAfter == nil {
 			t.Fatal("retryAfter is nil, want non-nil")
 		}
-		// Daily quota cooldown should be greater than 5min (it's time until midnight Beijing time)
+		if *retryAfter != qwenRateCooldown {
+			t.Errorf("retryAfter = %v, want %v", *retryAfter, qwenRateCooldown)
+		}
+	})
+
+	t.Run("daily quota exhaustion gets next-day cooldown", func(t *testing.T) {
+		body := []byte(`{"error":{"code":"insufficient_quota","message":"Daily quota exceeded, please try again tomorrow","type":"insufficient_quota"}}`)
+		errCode, retryAfter := wrapQwenError(ctx, http.StatusForbidden, body)
+
+		if errCode != http.StatusTooManyRequests {
+			t.Errorf("errCode = %d, want %d", errCode, http.StatusTooManyRequests)
+		}
+		if retryAfter == nil {
+			t.Fatal("retryAfter is nil, want non-nil")
+		}
 		if *retryAfter <= qwenRateCooldown {
 			t.Errorf("retryAfter = %v, expected to be significantly longer than %v for daily quota", *retryAfter, qwenRateCooldown)
 		}
