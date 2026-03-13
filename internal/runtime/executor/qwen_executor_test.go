@@ -223,6 +223,30 @@ func TestCheckQwenDailyLimit(t *testing.T) {
 			if err := checkQwenDailyLimit(authID); err != nil {
 				t.Fatalf("request %d: unexpected error: %v", i, err)
 			}
+			// Simulate successful request by recording it
+			recordQwenDailyRequest(authID)
+		}
+	})
+
+	t.Run("check only does not increment counter", func(t *testing.T) {
+		// Reset counters
+		qwenDailyCounter.Lock()
+		qwenDailyCounter.counts = make(map[string]*qwenDailyCount)
+		qwenDailyCounter.Unlock()
+
+		testID := "test-check-only"
+		// Call check many times without recording
+		for i := 0; i < 2000; i++ {
+			if err := checkQwenDailyLimit(testID); err != nil {
+				t.Fatalf("check-only request %d: unexpected error: %v (check should not increment)", i, err)
+			}
+		}
+		// Counter should still be 0
+		qwenDailyCounter.Lock()
+		dc := qwenDailyCounter.counts[testID]
+		qwenDailyCounter.Unlock()
+		if dc != nil && dc.count != 0 {
+			t.Errorf("counter = %d after check-only calls, want 0", dc.count)
 		}
 	})
 
@@ -264,6 +288,41 @@ func TestCheckQwenDailyLimit(t *testing.T) {
 			t.Fatalf("expected reset on new day, got error: %v", err)
 		}
 	})
+}
+
+func TestRecordQwenDailyRequest(t *testing.T) {
+	qwenDailyCounter.Lock()
+	qwenDailyCounter.counts = make(map[string]*qwenDailyCount)
+	qwenDailyCounter.Unlock()
+
+	authID := "test-record-daily"
+
+	// Record some requests
+	for i := 0; i < 5; i++ {
+		recordQwenDailyRequest(authID)
+	}
+
+	// Verify counter
+	qwenDailyCounter.Lock()
+	dc := qwenDailyCounter.counts[authID]
+	qwenDailyCounter.Unlock()
+	if dc == nil || dc.count != 5 {
+		t.Fatalf("count = %v, want 5", dc)
+	}
+
+	// Empty authID should be a no-op
+	recordQwenDailyRequest("")
+
+	// Fill to limit via recording
+	qwenDailyCounter.Lock()
+	qwenDailyCounter.counts[authID].count = qwenDailyLimit
+	qwenDailyCounter.Unlock()
+
+	// Check should now block
+	err := checkQwenDailyLimit(authID)
+	if err == nil {
+		t.Fatal("expected error at daily limit, got nil")
+	}
 }
 
 func TestMarkQwenDailyExhausted(t *testing.T) {

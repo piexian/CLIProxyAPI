@@ -147,6 +147,8 @@ func checkQwenRateLimit(authID string) error {
 // checkQwenDailyLimit checks if the credential has exceeded the daily request limit.
 // Qwen Code OAuth allows 1000 requests per day, resetting at 00:00 Beijing time.
 // Returns nil if allowed, or a statusErr with retryAfter if the daily limit is reached.
+// NOTE: This function only checks the limit; it does NOT increment the counter.
+// Call recordQwenDailyRequest after a successful upstream response to increment.
 func checkQwenDailyLimit(authID string) error {
 	if authID == "" {
 		return nil
@@ -174,8 +176,27 @@ func checkQwenDailyLimit(authID string) error {
 		}
 	}
 
-	dc.count++
 	return nil
+}
+
+// recordQwenDailyRequest increments the daily request counter for a credential.
+// Call this ONLY after a successful upstream response to avoid counting failed requests.
+func recordQwenDailyRequest(authID string) {
+	if authID == "" {
+		return
+	}
+
+	today := time.Now().In(qwenBeijingLoc).Format("2006-01-02")
+
+	qwenDailyCounter.Lock()
+	defer qwenDailyCounter.Unlock()
+
+	dc := qwenDailyCounter.counts[authID]
+	if dc == nil || dc.date != today {
+		dc = &qwenDailyCount{date: today, count: 0}
+		qwenDailyCounter.counts[authID] = dc
+	}
+	dc.count++
 }
 
 // markQwenDailyExhausted sets the daily counter for a credential to the limit,
@@ -428,6 +449,7 @@ func (e *QwenExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 		return resp, err
 	}
 	appendAPIResponseChunk(ctx, e.cfg, data)
+	recordQwenDailyRequest(authID)
 	reporter.publish(ctx, parseOpenAIUsage(data))
 	var param any
 	// Note: TranslateNonStream uses req.Model (original with suffix) to preserve
@@ -537,6 +559,7 @@ func (e *QwenExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 		err = statusErr{code: errCode, msg: string(b), retryAfter: retryAfter}
 		return nil, err
 	}
+	recordQwenDailyRequest(authID)
 	out := make(chan cliproxyexecutor.StreamChunk)
 	go func() {
 		defer close(out)
