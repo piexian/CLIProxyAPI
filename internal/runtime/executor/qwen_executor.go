@@ -71,6 +71,14 @@ var qwenDailyQuotaMessages = []string{
 	"midnight",
 }
 
+// qwenHardQuotaMessages identifies stronger quota exhaustion signals that can
+// arrive as 400 invalid_request_error responses. These indicate the current
+// auth can no longer use the model's free allocation, so the auth+model pair
+// should be cooled down much longer than a burst/rate limit.
+var qwenHardQuotaMessages = []string{
+	"free allocated quota exceeded",
+}
+
 // qwenRateLimiter tracks request timestamps per credential for rate limiting.
 // Qwen Code OAuth has a limit of 60 requests per minute per account.
 var qwenRateLimiter = struct {
@@ -278,6 +286,18 @@ func isQwenDailyQuotaError(body []byte) bool {
 	return false
 }
 
+// isQwenHardQuotaError checks for stronger model-specific free-quota exhaustion
+// signals. Qwen can return these as 400 invalid_request_error, not just 429.
+func isQwenHardQuotaError(body []byte) bool {
+	msg := strings.ToLower(gjson.GetBytes(body, "error.message").String())
+	for _, pattern := range qwenHardQuotaMessages {
+		if strings.Contains(msg, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
 // isQwenRateLimitError checks if the error response indicates a RPM/RPS rate limit
 // or a burst-rate stability protection error. These errors recover within ~1 minute,
 // unlike daily quota exhaustion which requires waiting until next day.
@@ -295,6 +315,7 @@ func isQwenRateLimitError(body []byte) bool {
 // It differentiates between:
 //   - RPM/burst rate limit errors → short cooldown
 //   - Explicit daily quota exhaustion errors → cooldown until next day (Beijing time 00:00)
+//   - Hard free-allocation exhaustion errors → cooldown until next day (heuristic)
 //   - Generic quota signals without a daily-reset hint → short cooldown
 //   - Other 429 errors → conservative short cooldown
 //
@@ -305,8 +326,9 @@ func isQwenRateLimitError(body []byte) bool {
 func wrapQwenError(ctx context.Context, httpCode int, body []byte) (errCode int, retryAfter *time.Duration, stopCredentialRotation bool) {
 	errCode = httpCode
 
-	// Only inspect 403 and 429 responses to avoid false positives
-	if httpCode != http.StatusForbidden && httpCode != http.StatusTooManyRequests {
+	// Inspect 400/403/429 because some Qwen quota exhaustion responses are
+	// returned as 400 invalid_request_error with an explicit quota message.
+	if httpCode != http.StatusBadRequest && httpCode != http.StatusForbidden && httpCode != http.StatusTooManyRequests {
 		return errCode, retryAfter, stopCredentialRotation
 	}
 
@@ -320,7 +342,18 @@ func wrapQwenError(ctx context.Context, httpCode int, body []byte) (errCode int,
 		return errCode, retryAfter, stopCredentialRotation
 	}
 
-	// Priority 2: Explicit daily quota exhaustion → cooldown until next day
+	// Priority 2: Hard free-allocation exhaustion → cooldown until next day.
+	// This is a heuristic cooldown because the upstream message does not carry
+	// a concrete reset timestamp, but repeated retries are known to be futile.
+	if isQwenHardQuotaError(body) {
+		errCode = http.StatusTooManyRequests
+		cooldown := timeUntilNextDay()
+		retryAfter = &cooldown
+		logWithRequestID(ctx).Warnf("qwen free allocation exhausted (http %d -> %d), cooling down until tomorrow (%v)", httpCode, errCode, cooldown)
+		return errCode, retryAfter, stopCredentialRotation
+	}
+
+	// Priority 3: Explicit daily quota exhaustion → cooldown until next day
 	if isQwenDailyQuotaError(body) {
 		errCode = http.StatusTooManyRequests
 		cooldown := timeUntilNextDay()
@@ -329,7 +362,7 @@ func wrapQwenError(ctx context.Context, httpCode int, body []byte) (errCode int,
 		return errCode, retryAfter, stopCredentialRotation
 	}
 
-	// Priority 3: Generic quota signal without a daily-reset hint → short cooldown
+	// Priority 4: Generic quota signal without a daily-reset hint → short cooldown
 	if isQwenQuotaError(body) {
 		errCode = http.StatusTooManyRequests
 		cooldown := qwenRateCooldown
@@ -339,7 +372,7 @@ func wrapQwenError(ctx context.Context, httpCode int, body []byte) (errCode int,
 		return errCode, retryAfter, stopCredentialRotation
 	}
 
-	// Priority 4: Other 429 errors → conservative short cooldown
+	// Priority 5: Other 429 errors → conservative short cooldown
 	if httpCode == http.StatusTooManyRequests {
 		cooldown := qwenRateCooldown
 		retryAfter = &cooldown

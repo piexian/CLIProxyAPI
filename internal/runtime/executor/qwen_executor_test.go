@@ -128,6 +128,39 @@ func TestIsQwenDailyQuotaError(t *testing.T) {
 	}
 }
 
+func TestIsQwenHardQuotaError(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want bool
+	}{
+		{
+			"free allocated quota exceeded",
+			`{"error":{"code":"insufficient_quota","message":"Free allocated quota exceeded.","type":"invalid_request_error"}}`,
+			true,
+		},
+		{
+			"generic insufficient_quota is not hard quota",
+			`{"error":{"code":"insufficient_quota","message":"You exceeded your current quota","type":"insufficient_quota"}}`,
+			false,
+		},
+		{
+			"empty body",
+			`{}`,
+			false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isQwenHardQuotaError([]byte(tt.body))
+			if got != tt.want {
+				t.Errorf("isQwenHardQuotaError(%q) = %v, want %v", tt.body, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestIsQwenRateLimitError(t *testing.T) {
 	tests := []struct {
 		name string
@@ -245,6 +278,24 @@ func TestWrapQwenErrorDifferentiation(t *testing.T) {
 		}
 		if *retryAfter <= qwenRateCooldown {
 			t.Errorf("retryAfter = %v, expected to be significantly longer than %v for daily quota", *retryAfter, qwenRateCooldown)
+		}
+		if stopRotation {
+			t.Fatal("stopRotation = true, want false")
+		}
+	})
+
+	t.Run("free allocated quota exceeded gets next-day heuristic cooldown", func(t *testing.T) {
+		body := []byte(`{"error":{"code":"insufficient_quota","message":"Free allocated quota exceeded.","type":"invalid_request_error"}}`)
+		errCode, retryAfter, stopRotation := wrapQwenError(ctx, http.StatusBadRequest, body)
+
+		if errCode != http.StatusTooManyRequests {
+			t.Errorf("errCode = %d, want %d", errCode, http.StatusTooManyRequests)
+		}
+		if retryAfter == nil {
+			t.Fatal("retryAfter is nil, want non-nil")
+		}
+		if *retryAfter <= qwenRateCooldown {
+			t.Errorf("retryAfter = %v, expected to be significantly longer than %v for hard quota exhaustion", *retryAfter, qwenRateCooldown)
 		}
 		if stopRotation {
 			t.Fatal("stopRotation = true, want false")
