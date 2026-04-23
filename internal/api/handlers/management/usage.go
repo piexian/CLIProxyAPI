@@ -28,6 +28,7 @@ func (h *Handler) GetUsageStatistics(c *gin.Context) {
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"usage":           snapshot,
+		"copilot":         usage.GetCopilotTracker().Snapshot(),
 		"failed_requests": snapshot.FailureCount,
 	})
 }

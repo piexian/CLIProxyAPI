@@ -190,3 +190,35 @@ func TestApplyOAuthModelAlias_SuffixPreservation(t *testing.T) {
 		t.Errorf("applyOAuthModelAlias() model = %q, want %q", resolvedModel, "gemini-2.5-pro-exp-03-25(8192)")
 	}
 }
+
+func TestResolveOAuthUpstreamModel_GitHubCopilotDefaultAlias(t *testing.T) {
+	t.Parallel()
+
+	mgr := NewManager(nil, nil, nil)
+	mgr.SetConfig(&internalconfig.Config{})
+	mgr.SetOAuthModelAlias(nil)
+
+	auth := createAuthForChannel("github-copilot")
+	got := mgr.resolveOAuthUpstreamModel(auth, "gpt-5-4(high)")
+	if got != "gpt-5.4(high)" {
+		t.Fatalf("resolveOAuthUpstreamModel() = %q, want %q", got, "gpt-5.4(high)")
+	}
+}
+
+func TestResolveOAuthUpstreamModel_GitHubCopilotUserAliasOverridesDefault(t *testing.T) {
+	t.Parallel()
+
+	mgr := NewManager(nil, nil, nil)
+	mgr.SetConfig(&internalconfig.Config{})
+	mgr.SetOAuthModelAlias(map[string][]internalconfig.OAuthModelAlias{
+		"github-copilot": {
+			{Name: "custom-model", Alias: "gpt-5-4"},
+		},
+	})
+
+	auth := createAuthForChannel("github-copilot")
+	got := mgr.resolveOAuthUpstreamModel(auth, "gpt-5-4")
+	if got != "custom-model" {
+		t.Fatalf("resolveOAuthUpstreamModel() = %q, want %q", got, "custom-model")
+	}
+}

@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -128,11 +129,27 @@ type Config struct {
 
 	// OAuthModelAlias defines global model name aliases for OAuth/file-backed auth channels.
 	// These aliases affect both model listing and model routing for supported channels:
-	// gemini-cli, vertex, aistudio, antigravity, claude, codex, kimi.
+	// gemini-cli, vertex, aistudio, antigravity, claude, codex, github-copilot, kimi.
 	//
 	// NOTE: This does not apply to existing per-credential model alias features under:
 	// gemini-api-key, codex-api-key, claude-api-key, openai-compatibility, vertex-api-key, and ampcode.
 	OAuthModelAlias map[string][]OAuthModelAlias `yaml:"oauth-model-alias,omitempty" json:"oauth-model-alias,omitempty"`
+
+	// GitHubCopilotPremiumModelMultipliers defines optional local weighting for GitHub Copilot
+	// premium-usage accounting. Keys are model IDs, values are non-negative request multipliers.
+	// These weights are used only for local statistics aggregation and do not affect upstream quota.
+	GitHubCopilotPremiumModelMultipliers map[string]float64 `yaml:"github-copilot-premium-model-multipliers,omitempty" json:"github-copilot-premium-model-multipliers,omitempty"`
+
+	// GitHubCopilotRateLimitSeconds defines the minimum interval between GitHub Copilot requests.
+	// When > 0, requests are globally paced across the current process to reduce upstream rate limiting.
+	// The RATE_LIMIT environment variable overrides this value.
+	GitHubCopilotRateLimitSeconds int `yaml:"github-copilot-rate-limit-seconds,omitempty" json:"github-copilot-rate-limit-seconds,omitempty"`
+
+	// GitHubCopilotRateLimitWait controls what happens when the Copilot request rate limit is hit.
+	// When true, requests wait in a global queue; when false, requests fail fast with HTTP 429.
+	// The default is true to prefer queueing over surfacing local rate-limit errors.
+	// The RATE_LIMIT_WAIT environment variable overrides this value.
+	GitHubCopilotRateLimitWait *bool `yaml:"github-copilot-rate-limit-wait,omitempty" json:"github-copilot-rate-limit-wait,omitempty"`
 
 	// Payload defines default and override rules for provider payload parameters.
 	Payload PayloadConfig `yaml:"payload" json:"payload"`
@@ -616,6 +633,8 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
 	}
 
+	applyGitHubCopilotRateLimitEnvOverrides(&cfg)
+
 	// NOTE: Startup legacy key migration is intentionally disabled.
 	// Reason: avoid mutating config.yaml during server startup.
 	// Re-enable the block below if automatic startup migration is needed again.
@@ -694,6 +713,12 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 
 	// Normalize global OAuth model name aliases.
 	cfg.SanitizeOAuthModelAlias()
+
+	// Normalize GitHub Copilot premium usage multipliers.
+	cfg.SanitizeGitHubCopilotPremiumModelMultipliers()
+
+	// Normalize GitHub Copilot request pacing settings.
+	cfg.SanitizeGitHubCopilotRateLimit()
 
 	// Validate raw payload rules and drop invalid entries.
 	cfg.SanitizePayloadRules()
@@ -800,7 +825,15 @@ func (cfg *Config) SanitizeClaudeHeaderDefaults() {
 // It trims whitespace, normalizes channel keys to lower-case, drops empty entries,
 // allows multiple aliases per upstream name, and ensures aliases are unique within each channel.
 func (cfg *Config) SanitizeOAuthModelAlias() {
-	if cfg == nil || len(cfg.OAuthModelAlias) == 0 {
+	if cfg == nil {
+		return
+	}
+
+	if cfg.OAuthModelAlias == nil {
+		cfg.OAuthModelAlias = make(map[string][]OAuthModelAlias)
+	}
+
+	if len(cfg.OAuthModelAlias) == 0 {
 		return
 	}
 	out := make(map[string][]OAuthModelAlias, len(cfg.OAuthModelAlias))
@@ -832,6 +865,79 @@ func (cfg *Config) SanitizeOAuthModelAlias() {
 		}
 	}
 	cfg.OAuthModelAlias = out
+}
+
+// SanitizeGitHubCopilotPremiumModelMultipliers normalizes Copilot local premium-usage weights.
+// Built-in defaults are always present unless explicitly overridden by the user config.
+func (cfg *Config) SanitizeGitHubCopilotPremiumModelMultipliers() {
+	if cfg == nil {
+		return
+	}
+
+	defaults := defaultGitHubCopilotPremiumModelMultipliers()
+	if len(cfg.GitHubCopilotPremiumModelMultipliers) == 0 {
+		cfg.GitHubCopilotPremiumModelMultipliers = defaults
+		return
+	}
+
+	out := make(map[string]float64, len(defaults)+len(cfg.GitHubCopilotPremiumModelMultipliers))
+	for model, multiplier := range defaults {
+		out[model] = multiplier
+	}
+	for rawModel, multiplier := range cfg.GitHubCopilotPremiumModelMultipliers {
+		model := strings.ToLower(strings.TrimSpace(rawModel))
+		if model == "" || multiplier < 0 {
+			continue
+		}
+		out[model] = multiplier
+	}
+	cfg.GitHubCopilotPremiumModelMultipliers = out
+}
+
+// SanitizeGitHubCopilotRateLimit normalizes Copilot global request pacing settings.
+// Queue mode defaults to enabled so rate-limited requests wait rather than fail fast.
+func (cfg *Config) SanitizeGitHubCopilotRateLimit() {
+	if cfg == nil {
+		return
+	}
+	if cfg.GitHubCopilotRateLimitSeconds < 0 {
+		cfg.GitHubCopilotRateLimitSeconds = 0
+	}
+	if cfg.GitHubCopilotRateLimitWait == nil {
+		enabled := true
+		cfg.GitHubCopilotRateLimitWait = &enabled
+	}
+}
+
+func applyGitHubCopilotRateLimitEnvOverrides(cfg *Config) {
+	if cfg == nil {
+		return
+	}
+	if raw, ok := os.LookupEnv("RATE_LIMIT"); ok {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			cfg.GitHubCopilotRateLimitSeconds = 0
+		} else {
+			seconds, err := strconv.Atoi(raw)
+			if err != nil || seconds < 0 {
+				log.WithField("value", raw).Warn("invalid RATE_LIMIT ignored")
+			} else {
+				cfg.GitHubCopilotRateLimitSeconds = seconds
+			}
+		}
+	}
+	if raw, ok := os.LookupEnv("RATE_LIMIT_WAIT"); ok {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			return
+		}
+		waitEnabled, err := strconv.ParseBool(raw)
+		if err != nil {
+			log.WithField("value", raw).Warn("invalid RATE_LIMIT_WAIT ignored")
+			return
+		}
+		cfg.GitHubCopilotRateLimitWait = &waitEnabled
+	}
 }
 
 // SanitizeOpenAICompatibility removes OpenAI-compatibility provider entries that are

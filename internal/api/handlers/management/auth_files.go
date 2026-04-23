@@ -24,6 +24,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/antigravity"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/claude"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/copilot"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
 	geminiAuth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/gemini"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/kimi"
@@ -2176,6 +2177,114 @@ func (h *Handler) RequestKimiToken(c *gin.Context) {
 	}()
 
 	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
+}
+
+func (h *Handler) RequestGitHubToken(c *gin.Context) {
+	ctx := context.Background()
+
+	fmt.Println("Initializing GitHub Copilot authentication...")
+
+	state := fmt.Sprintf("gh-%d", time.Now().UnixNano())
+	deviceClient := copilot.NewDeviceFlowClient(h.cfg)
+
+	deviceCode, err := deviceClient.RequestDeviceCode(ctx)
+	if err != nil {
+		log.Errorf("Failed to initiate device flow: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to initiate device flow"})
+		return
+	}
+
+	authURL := deviceCode.VerificationURI
+	userCode := deviceCode.UserCode
+
+	RegisterOAuthSession(state, "github-copilot")
+
+	go func() {
+		fmt.Printf("Please visit %s and enter code: %s\n", authURL, userCode)
+
+		tokenData, errPoll := deviceClient.PollForToken(ctx, deviceCode)
+		if errPoll != nil {
+			SetOAuthSessionError(state, "Authentication failed")
+			fmt.Printf("Authentication failed: %v\n", errPoll)
+			return
+		}
+
+		userInfo, errUser := deviceClient.FetchUserInfo(ctx, tokenData.AccessToken)
+		if errUser != nil {
+			log.Warnf("Failed to fetch user info: %v", errUser)
+		}
+
+		username := userInfo.Login
+		if username == "" {
+			username = "github-user"
+		}
+
+		tokenStorage := &copilot.CopilotTokenStorage{
+			AccessToken: tokenData.AccessToken,
+			TokenType:   tokenData.TokenType,
+			Scope:       tokenData.Scope,
+			Username:    username,
+			Email:       userInfo.Email,
+			Name:        userInfo.Name,
+			Type:        "github-copilot",
+		}
+
+		fileName := fmt.Sprintf("github-copilot-%s.json", username)
+		label := userInfo.Email
+		if label == "" {
+			label = username
+		}
+		metadata, errMeta := copilotTokenMetadata(tokenStorage)
+		if errMeta != nil {
+			log.Errorf("Failed to build token metadata: %v", errMeta)
+			SetOAuthSessionError(state, "Failed to build token metadata")
+			return
+		}
+
+		record := &coreauth.Auth{
+			ID:       fileName,
+			Provider: "github-copilot",
+			Label:    label,
+			FileName: fileName,
+			Storage:  tokenStorage,
+			Metadata: metadata,
+		}
+
+		savedPath, errSave := h.saveTokenRecord(ctx, record)
+		if errSave != nil {
+			log.Errorf("Failed to save authentication tokens: %v", errSave)
+			SetOAuthSessionError(state, "Failed to save authentication tokens")
+			return
+		}
+
+		fmt.Printf("Authentication successful! Token saved to %s\n", savedPath)
+		fmt.Println("You can now use GitHub Copilot services through this CLI")
+		CompleteOAuthSession(state)
+		CompleteOAuthSessionsByProvider("github-copilot")
+	}()
+
+	c.JSON(http.StatusOK, gin.H{
+		"status":           "ok",
+		"url":              authURL,
+		"state":            state,
+		"user_code":        userCode,
+		"verification_uri": authURL,
+	})
+}
+
+func copilotTokenMetadata(storage *copilot.CopilotTokenStorage) (map[string]any, error) {
+	if storage == nil {
+		return nil, fmt.Errorf("token storage is nil")
+	}
+	payload, errMarshal := json.Marshal(storage)
+	if errMarshal != nil {
+		return nil, fmt.Errorf("marshal token storage: %w", errMarshal)
+	}
+	metadata := make(map[string]any)
+	if errUnmarshal := json.Unmarshal(payload, &metadata); errUnmarshal != nil {
+		return nil, fmt.Errorf("unmarshal token storage: %w", errUnmarshal)
+	}
+	return metadata, nil
 }
 
 type projectSelectionRequiredError struct{}

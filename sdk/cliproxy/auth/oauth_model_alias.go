@@ -18,18 +18,20 @@ type oauthModelAliasTable struct {
 }
 
 func compileOAuthModelAliasTable(aliases map[string][]internalconfig.OAuthModelAlias) *oauthModelAliasTable {
-	if len(aliases) == 0 {
-		return &oauthModelAliasTable{}
-	}
 	out := &oauthModelAliasTable{
-		reverse: make(map[string]map[string]string, len(aliases)),
+		reverse: make(map[string]map[string]string, len(aliases)+1),
 	}
-	for rawChannel, entries := range aliases {
+
+	appendEntries := func(rawChannel string, entries []internalconfig.OAuthModelAlias) {
 		channel := strings.ToLower(strings.TrimSpace(rawChannel))
 		if channel == "" || len(entries) == 0 {
-			continue
+			return
 		}
-		rev := make(map[string]string, len(entries))
+		rev := out.reverse[channel]
+		if rev == nil {
+			rev = make(map[string]string, len(entries))
+			out.reverse[channel] = rev
+		}
 		for _, entry := range entries {
 			name := strings.TrimSpace(entry.Name)
 			alias := strings.TrimSpace(entry.Alias)
@@ -45,10 +47,15 @@ func compileOAuthModelAliasTable(aliases map[string][]internalconfig.OAuthModelA
 			}
 			rev[aliasKey] = name
 		}
-		if len(rev) > 0 {
-			out.reverse[channel] = rev
+		if len(rev) == 0 {
+			delete(out.reverse, channel)
 		}
 	}
+
+	for rawChannel, entries := range aliases {
+		appendEntries(rawChannel, entries)
+	}
+	appendEntries("github-copilot", internalconfig.DefaultGitHubCopilotAliases())
 	if len(out.reverse) == 0 {
 		out.reverse = nil
 	}
@@ -265,7 +272,7 @@ func modelAliasChannel(auth *Auth) string {
 // and auth kind. Returns empty string if the provider/authKind combination doesn't support
 // OAuth model alias (e.g., API key authentication).
 //
-// Supported channels: gemini-cli, vertex, aistudio, antigravity, claude, codex, kimi.
+// Supported channels: gemini-cli, vertex, aistudio, antigravity, claude, codex, github-copilot, kimi.
 func OAuthModelAliasChannel(provider, authKind string) string {
 	provider = strings.ToLower(strings.TrimSpace(provider))
 	authKind = strings.ToLower(strings.TrimSpace(authKind))
@@ -289,7 +296,7 @@ func OAuthModelAliasChannel(provider, authKind string) string {
 			return ""
 		}
 		return "codex"
-	case "gemini-cli", "aistudio", "antigravity", "kimi":
+	case "gemini-cli", "aistudio", "antigravity", "github-copilot", "kimi":
 		return provider
 	default:
 		return ""

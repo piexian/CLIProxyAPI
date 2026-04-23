@@ -54,3 +54,23 @@ func TestSanitizeOAuthModelAlias_AllowsMultipleAliasesForSameName(t *testing.T) 
 		}
 	}
 }
+
+func TestSanitizeOAuthModelAlias_GitHubCopilotDoesNotInjectDefaults(t *testing.T) {
+	cfg := &Config{
+		OAuthModelAlias: map[string][]OAuthModelAlias{
+			"github-copilot": {
+				{Name: "gpt-5.4", Alias: "custom-gpt-5-4", Fork: true},
+			},
+		},
+	}
+
+	cfg.SanitizeOAuthModelAlias()
+
+	aliases := cfg.OAuthModelAlias["github-copilot"]
+	if len(aliases) != 1 {
+		t.Fatalf("expected 1 sanitized alias, got %d", len(aliases))
+	}
+	if aliases[0].Name != "gpt-5.4" || aliases[0].Alias != "custom-gpt-5-4" || !aliases[0].Fork {
+		t.Fatalf("expected github-copilot alias to remain unchanged, got name=%q alias=%q fork=%v", aliases[0].Name, aliases[0].Alias, aliases[0].Fork)
+	}
+}

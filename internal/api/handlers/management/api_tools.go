@@ -11,8 +11,10 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	copilotauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/copilot"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/geminicli"
+	internalusage "github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
@@ -629,6 +631,75 @@ func (h *Handler) authByIndex(authIndex string) *coreauth.Auth {
 		}
 	}
 	return nil
+}
+
+// GetCopilotQuota fetches GitHub Copilot quota information from GitHub.
+func (h *Handler) GetCopilotQuota(c *gin.Context) {
+	authIndex := strings.TrimSpace(c.Query("auth_index"))
+	if authIndex == "" {
+		authIndex = strings.TrimSpace(c.Query("authIndex"))
+	}
+	if authIndex == "" {
+		authIndex = strings.TrimSpace(c.Query("AuthIndex"))
+	}
+
+	auth := h.findCopilotAuth(authIndex)
+	if auth == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "no github copilot credential found"})
+		return
+	}
+
+	token, tokenErr := h.resolveTokenForAuth(c.Request.Context(), auth)
+	if tokenErr != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "failed to refresh copilot token"})
+		return
+	}
+	if token == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "copilot token not found"})
+		return
+	}
+
+	copilotClient := copilotauth.NewCopilotAuth(h.cfg)
+	copilotClient.SetHTTPClient(&http.Client{
+		Timeout:   defaultAPICallTimeout,
+		Transport: h.apiCallTransport(auth),
+	})
+	usageResp, errUsage := copilotClient.GetUsageWithGitHubToken(c.Request.Context(), token)
+	if errUsage != nil {
+		log.WithError(errUsage).Debug("copilot quota request failed")
+		c.JSON(http.StatusBadGateway, gin.H{"error": "request failed", "detail": errUsage.Error()})
+		return
+	}
+	internalusage.GetCopilotTracker().UpdateQuota(auth, usageResp)
+	c.JSON(http.StatusOK, usageResp)
+}
+
+func (h *Handler) findCopilotAuth(authIndex string) *coreauth.Auth {
+	if h == nil || h.authManager == nil {
+		return nil
+	}
+
+	auths := h.authManager.List()
+	var firstCopilot *coreauth.Auth
+	for _, auth := range auths {
+		if auth == nil {
+			continue
+		}
+		provider := strings.ToLower(strings.TrimSpace(auth.Provider))
+		if provider != "copilot" && provider != "github" && provider != "github-copilot" {
+			continue
+		}
+		if firstCopilot == nil {
+			firstCopilot = auth
+		}
+		if authIndex != "" {
+			auth.EnsureIndex()
+			if auth.Index == authIndex {
+				return auth
+			}
+		}
+	}
+	return firstCopilot
 }
 
 func (h *Handler) apiCallTransport(auth *coreauth.Auth) http.RoundTripper {
