@@ -537,7 +537,7 @@ func codexMultipartFileToDataURL(fileHeader *multipart.FileHeader) (string, erro
 		}
 	}()
 
-	data, errRead := io.ReadAll(f)
+	data, errRead := io.ReadAll(io.LimitReader(f, 10<<20))
 	if errRead != nil {
 		return "", fmt.Errorf("read upload file failed: %w", errRead)
 	}

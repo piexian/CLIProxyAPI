@@ -250,7 +250,7 @@ func fetchModels(ctx context.Context, auth *coreauth.Auth, accessToken, clientVe
 		util.ApplyCustomHeadersFromAttrs(httpReq, auth.Attributes)
 	}
 
-	httpClient := &http.Client{}
+	httpClient := &http.Client{Timeout: 30 * time.Second}
 	if auth != nil {
 		if transport, _, errProxy := proxyutil.BuildHTTPTransport(auth.ProxyURL); errProxy == nil && transport != nil {
 			httpClient.Transport = transport

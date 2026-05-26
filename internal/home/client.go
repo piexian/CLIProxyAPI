@@ -754,6 +754,11 @@ func (c *Client) StartConfigSubscriber(ctx context.Context, onConfig func([]byte
 		for {
 			event, errMsg := pubsub.ReceiveTimeout(ctx, homeSubscriptionReceiveTimeout)
 			if errMsg != nil {
+				if isTimeoutError(errMsg) {
+					if errPing := pubsub.Ping(ctx); errPing == nil {
+						continue
+					}
+				}
 				_ = pubsub.Close()
 				c.heartbeatOK.Store(false)
 				if isTimeoutError(errMsg) {

@@ -406,7 +406,7 @@ func (c *CopilotAuth) ListModels(ctx context.Context, apiToken *CopilotAPIToken)
 	modelsURL := copilotAPIEndpoint + "/models"
 	if ep := strings.TrimRight(apiToken.Endpoints.API, "/"); ep != "" {
 		parsed, err := url.Parse(ep)
-		if err == nil && parsed.Scheme == "https" && allowedCopilotAPIHosts[parsed.Host] {
+		if err == nil && parsed.Scheme == "https" && allowedCopilotAPIHosts[parsed.Hostname()] {
 			modelsURL = ep + "/models"
 		} else {
 			log.Warnf("copilot: ignoring untrusted API endpoint %q, using default", ep)
