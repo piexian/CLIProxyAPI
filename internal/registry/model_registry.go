@@ -55,6 +55,11 @@ type ModelInfo struct {
 	// SupportedOutputModalities lists supported output modalities (e.g., TEXT, IMAGE)
 	SupportedOutputModalities []string `json:"supportedOutputModalities,omitempty"`
 
+	// SupportedEndpoints lists provider-specific API endpoints the model can be served on
+	// (e.g., "/chat/completions", "/responses"). Currently used by GitHub Copilot to gate
+	// per-model routing between Chat and Responses APIs.
+	SupportedEndpoints []string `json:"supported_endpoints,omitempty"`
+
 	// Thinking holds provider-specific reasoning/thinking budget capabilities.
 	// This is optional and currently used for Gemini thinking budget normalization.
 	Thinking *ThinkingSupport `json:"thinking,omitempty"`
@@ -539,6 +544,9 @@ func cloneModelInfo(model *ModelInfo) *ModelInfo {
 	}
 	if len(model.SupportedOutputModalities) > 0 {
 		copyModel.SupportedOutputModalities = append([]string(nil), model.SupportedOutputModalities...)
+	}
+	if len(model.SupportedEndpoints) > 0 {
+		copyModel.SupportedEndpoints = append([]string(nil), model.SupportedEndpoints...)
 	}
 	if model.Thinking != nil {
 		copyThinking := *model.Thinking

@@ -9,6 +9,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
+	internalusage "github.com/router-for-me/CLIProxyAPI/v7/internal/usage"
 )
 
 type usageQueueRecord []byte
@@ -52,4 +53,10 @@ func parseUsageQueueCount(value string) (int, error) {
 		return 0, errors.New("count must be a positive integer")
 	}
 	return count, nil
+}
+
+// GetCopilotUsage returns the in-memory GitHub Copilot usage snapshot.
+// Counts are tallied locally by the Copilot executor and do not reflect upstream quota.
+func (h *Handler) GetCopilotUsage(c *gin.Context) {
+	c.JSON(http.StatusOK, internalusage.GetCopilotTracker().Snapshot())
 }
